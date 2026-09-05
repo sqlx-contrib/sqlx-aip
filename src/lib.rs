@@ -201,8 +201,27 @@ use sqlx_cel::Options;
 /// The dialect is not part of this: it describes the database being queried,
 /// not the request being served, so it is an argument to
 /// [`rewrite`](Query::rewrite).
+///
+/// Three of the four fields are absent on a first unfiltered page, so
+/// [`Default`] is usually the shortest way to build one. The default
+/// [`columns`](Query::columns) map is empty, which rejects every path — the
+/// derived default is the fail-closed one, not an open door.
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # use sqlx_aip::{Columns, Query, dialect};
+/// # const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[("name", "volumes.id")]);
+/// let query = Query {
+///     order_by: "name".parse()?,
+///     columns: VOLUME_COLUMNS,
+///     ..Default::default()
+/// };
+/// # query.rewrite(dialect::Postgres)?;
+/// # Ok(())
+/// # }
+/// ```
 // Not `Clone`: `cel::Program` is not.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Query<'a> {
     /// The compiled AIP-160 `filter`, or [`None`] when the request carried
     /// none.
