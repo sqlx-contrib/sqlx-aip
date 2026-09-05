@@ -25,12 +25,34 @@ pedantic = { level = "deny", priority = -1 }
 # A sibling checkout would work here too and is quicker to iterate against, but
 # it makes a standalone clone of this repo unbuildable.
 aip = { package = "aip-rs", git = "https://github.com/protoc-contrib/aip-rs" }
-sqlx-cel = { git = "https://github.com/sqlx-contrib/sqlx-cel" }
+# `default-features = false` so that this crate's own `chrono` / `time` features
+# are the only thing deciding which type `Value::Timestamp` holds. With
+# sqlx-cel's defaults on, `chrono` would be unconditional and `--features time`
+# would silently do nothing.
+sqlx-cel = { git = "https://github.com/sqlx-contrib/sqlx-cel", default-features = false, features = ["postgres"] }
 # Only to name `cel::Program` in the public API; the transpiling is sqlx-cel's.
 cel = { version = "0.14", default-features = false }
-sqlx = { version = "0.9", default-features = false, features = ["postgres"] }
+# Direct dependencies, at the versions sqlx-cel resolves, only so that a
+# `CursorValue::Timestamp` can be built into the `Value::Timestamp` this
+# backend's variant holds. Which of the two is active is sqlx-cel's choice, and
+# the `cfg`s in `cursor.rs` mirror it exactly.
+chrono = { version = "0.4", optional = true, default-features = false, features = ["alloc"] }
+time = { version = "0.3", optional = true, default-features = false }
+
+[dev-dependencies]
+# The library itself names no sqlx type -- it hands back `sqlx_cel::Value` and
+# the caller binds it. These are for the doctests and the round-trip test.
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "chrono", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["chrono"]
-chrono = ["sqlx-cel/chrono"]
-time = ["sqlx-cel/time"]
+
+# Which type `Value::Timestamp` holds. With both on, `chrono` wins -- that is
+# sqlx-cel's rule, not a second one invented here.
+chrono = ["dep:chrono", "sqlx-cel/chrono"]
+time = ["dep:time", "sqlx-cel/time"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

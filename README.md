@@ -11,17 +11,31 @@ is why it exists as its own crate: `aip-rs` has no dependencies and intends to
 keep it that way.
 
 ```rust
-let query = sqlx_aip::Query {
+use sqlx_aip::{BindAll, Columns, Query, QueryFragment};
+
+// AIP path -> DB column. Fail-closed: a path that is absent is an error.
+const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[
+    ("name", "volumes.id"),
+    ("title", "volumes.title"),
+    ("create_time", "volumes.created_at"),
+]);
+
+let query = Query {
     filter: request.parse_filter()?,          // Option<cel::Program>
     order_by: request.parse_order_by()?,      // aip::OrderBy
     page_token: request.parse_page_token()?,  // aip::PageToken
-    columns: VOLUME_COLUMNS,                  // AIP path -> DB column, fail-closed
+    columns: VOLUME_COLUMNS,
 };
 
-let sqlx_aip::Rewritten { where_sql, order_sql, values } = query.rewrite()?;
+let QueryFragment { where_sql, order_sql, values } = query.rewrite()?;
+
+// Each fragment is `None` when it has nothing to say, so omitting the keyword
+// is the obvious move rather than something to remember.
+let where_clause = where_sql.map_or(String::new(), |sql| format!("WHERE {sql}"));
+let order_clause = order_sql.map_or(String::new(), |sql| format!("ORDER BY {sql}"));
 
 let volumes = sqlx::query_as::<_, Volume>(AssertSqlSafe(format!(
-        "SELECT * FROM volumes WHERE {where_sql} ORDER BY {order_sql} LIMIT ${}",
+        "SELECT * FROM volumes {where_clause} {order_clause} LIMIT ${}",
         values.len() + 1)))
     .bind_all(values)
     .bind(page_size)
@@ -34,21 +48,56 @@ The three parsers come from
 which generates them onto the request type. Nothing stops a caller building
 `aip::OrderBy` and `aip::PageToken` by hand.
 
+## Stability is the caller's job
+
+**A keyset cursor is only stable if the ordering ends in a unique column.**
+Append the primary key to `order_by.fields` before rewriting, and make sure the
+cursor carries a matching trailing value — as `name` does above. Without a
+unique tiebreaker, rows sharing the leading sort key have no defined order
+between pages, so a page can repeat rows it already served and skip ones it
+never did, with no error anywhere. This is the single most likely way to use
+the crate wrongly.
+
+Relatedly, an ordering column must be `NOT NULL`. A null cursor value is
+rejected rather than bound, because `col > $1` with a NULL bind evaluates to
+NULL and silently drops the row.
+
 ## Status
 
-**Not implemented.** This repository currently holds the design only. The
-specification in `docs/` is complete enough to implement against, and every
-external API it cites was verified against the published sources rather than
-recalled.
+Implemented, and specified by `docs/`:
 
 | Document | What it settles |
 | --- | --- |
 | [docs/query.md](docs/query.md) | The rewrite contract, composition order, `order_by`, errors |
 | [docs/cursor.md](docs/cursor.md) | The keyset predicate, and the decision to reject null cursor values |
 
-Start with `docs/query.md`. It depends on
-[sqlx-cel](https://github.com/sqlx-contrib/sqlx-cel), which is also unbuilt —
-build that first, since this crate is roughly 200 lines of glue on top of it.
+One deliberate departure from the specification, which `docs/query.md` invites:
+`where_sql` and `order_sql` are `Option<String>` rather than the empty string
+pgxaip returns.
+
+## Development
+
+The dev shell brings its own toolchain and Postgres:
+
+```sh
+nix develop          # or `direnv allow`
+pg-start             # a throwaway cluster in ./.pgdata, on port 55432
+cargo test
+pg-stop
+```
+
+`cargo test` runs the unit tests and doctests anywhere. The round-trip tests in
+`tests/postgres.rs` need a database and skip without one, so set `DATABASE_URL`
+if you are not using `pg-start`:
+
+```sh
+DATABASE_URL=postgres://localhost/sqlx_aip_test cargo test
+```
+
+They page through a table with a deliberately non-unique leading sort column
+and assert that no row is seen twice and none is skipped. An ordering bug of
+that kind does not show up in fragment-level assertions, which is why CI runs
+them against a real Postgres rather than letting them skip.
 
 ## Scope
 
