@@ -14,66 +14,64 @@ jobs:
       contents: read
       pull-requests: write
     timeout-minutes: 30
-    # tests/postgres.rs skips without a database, and the round-trip it asserts
-    # -- that paging a non-unique sort column sees every row exactly once -- is
-    # the one thing fragment-level assertions cannot stand in for. Silently
-    # skipping it in CI would leave the crate's central claim untested.
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: sqlx_aip_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/sqlx_aip_test
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+      # Brings up .devcontainer/docker-compose.yml -- including the Postgres
+      # tests/postgres.rs runs against -- and tears it down in a post-step even
+      # if the job is cancelled. DATABASE_URL is not set here: the shell hook
+      # gets it from `devcontainer-env export`, so it is defined once, in
+      # devcontainer.json.
+      #
+      # Nix then runs on the runner itself rather than inside the container.
+      # Building the devcontainer anyway is what keeps its definition honest --
+      # a broken one fails CI instead of only failing the next contributor.
+      - name: Setup Devcontainer
+        uses: devcontainer-env/devcontainer-ci@v1
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
       - name: Setup Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+        uses: DeterminateSystems/magic-nix-cache-action@v14
         with:
           use-flakehub: disabled
           use-gha-cache: enabled
       - name: Check Formatting
         run: nix develop --command cargo fmt --check
       - name: Lint
-        run: nix develop --command cargo clippy --all-targets
+        run: nix develop --command cargo clippy --all-targets --features sqlite,mysql
       - name: Run Tests
-        run: nix develop --command cargo test
+        run: nix develop --command cargo test --features sqlite,mysql
       - name: Check Documentation
-        run: nix develop --command cargo doc --no-deps
+        run: nix develop --command cargo doc --no-deps --features sqlite,mysql
         env:
           RUSTDOCFLAGS: -D warnings
-      # The date-time backend is behind a Cargo feature, and the combinations do
-      # not compile for free: the `cfg` that is right for chrono is a missing
-      # arm under time. Sweeping them is what catches that, and it is cheap next
-      # to the Nix setup this job has already paid for.
+      # Every driver and date-time backend is behind a Cargo feature, and the
+      # combinations do not compile for free: a `cfg` that is right for one is
+      # dead code or a missing arm in another. Sweeping them is what catches
+      # that, and it is cheap next to the Nix setup this job has already paid
+      # for.
       #
-      # The empty set is swept too, as a *negative*: the crate refuses to build
+      # A driver-less build is swept too, because the dialects are pure text and
+      # must stay usable without one -- only `bind_all` needs a driver.
+      #
+      # And the date-time-less set as a *negative*: the crate refuses to build
       # without a backend, because a Timestamp cursor value would have nowhere
-      # to go. If that `compile_error!` ever stops firing, the mapping in
-      # docs/cursor.md has quietly become partial.
+      # to go. If that `compile_error!` ever stops firing, the CursorValue
+      # mapping has quietly become partial.
       - name: Check Feature Combinations
         run: |
           nix develop --command bash -c '
             set -euo pipefail
-            for features in "chrono" "time" "chrono,time"; do
+            for features in "chrono" "time" "chrono,time" \
+                            "chrono,postgres" "time,sqlite" "chrono,mysql" \
+                            "chrono,time,postgres,sqlite,mysql"; do
               echo "::group::features: [$features]"
               cargo test --no-default-features --features "$features"
               echo "::endgroup::"
             done
-            echo "::group::features: [] must not build"
-            if cargo check --no-default-features 2>/dev/null; then
-              echo "expected --no-default-features to fail: no date-time backend"
+            echo "::group::features: [postgres] must not build"
+            if cargo check --no-default-features --features postgres 2>/dev/null; then
+              echo "expected a build with no date-time backend to fail"
               exit 1
             fi
             echo "::endgroup::"
@@ -92,7 +90,7 @@ jobs:
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Create Release PR
@@ -115,11 +113,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
       - name: Setup Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+        uses: DeterminateSystems/magic-nix-cache-action@v14
         with:
           use-flakehub: disabled
           use-gha-cache: enabled

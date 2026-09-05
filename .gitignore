@@ -6,8 +6,5 @@ result
 result-*
 .direnv/
 
-# The throwaway Postgres cluster `pg-start` creates in the dev shell.
-/.pgdata
-
 # macOS
 .DS_Store

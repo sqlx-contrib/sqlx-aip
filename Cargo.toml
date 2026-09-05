@@ -5,9 +5,9 @@ edition = "2024"
 # Not a choice: sqlx 0.9 declares it. See sqlx-cel's docs/values.md.
 rust-version = "1.94"
 license = "MIT"
-description = "Rewrites an AIP List request's filter, order_by and page_token into Postgres SQL fragments, for sqlx."
+description = "Rewrites an AIP List request's filter, order_by and page_token into SQL fragments, for sqlx."
 repository = "https://github.com/sqlx-contrib/sqlx-aip"
-keywords = ["aip", "sqlx", "postgres", "pagination"]
+keywords = ["aip", "sqlx", "postgres", "sqlite", "pagination"]
 categories = ["database"]
 
 # Denied rather than warned, because several consumers in this ecosystem deny
@@ -25,11 +25,11 @@ pedantic = { level = "deny", priority = -1 }
 # A sibling checkout would work here too and is quicker to iterate against, but
 # it makes a standalone clone of this repo unbuildable.
 aip = { package = "aip-rs", git = "https://github.com/protoc-contrib/aip-rs" }
-# `default-features = false` so that this crate's own `chrono` / `time` features
-# are the only thing deciding which type `Value::Timestamp` holds. With
-# sqlx-cel's defaults on, `chrono` would be unconditional and `--features time`
+# `default-features = false` so that this crate's own features are the only
+# thing deciding the driver and the date-time backend. With sqlx-cel's defaults
+# on, `postgres` and `chrono` would both be unconditional and `--features time`
 # would silently do nothing.
-sqlx-cel = { git = "https://github.com/sqlx-contrib/sqlx-cel", default-features = false, features = ["postgres"] }
+sqlx-cel = { git = "https://github.com/sqlx-contrib/sqlx-cel", default-features = false }
 # Only to name `cel::Program` in the public API; the transpiling is sqlx-cel's.
 cel = { version = "0.14", default-features = false }
 # Direct dependencies, at the versions sqlx-cel resolves, only so that a
@@ -42,11 +42,19 @@ time = { version = "0.3", optional = true, default-features = false }
 [dev-dependencies]
 # The library itself names no sqlx type -- it hands back `sqlx_cel::Value` and
 # the caller binds it. These are for the doctests and the round-trip test.
-sqlx = { version = "0.9", default-features = false, features = ["postgres", "chrono", "runtime-tokio"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "sqlite", "mysql", "chrono", "runtime-tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-default = ["chrono"]
+default = ["chrono", "postgres"]
+
+# Driver support, forwarded to sqlx-cel: each supplies `Encode`/`Type` for
+# `Value` and makes `bind_all` available on that driver's queries. The
+# *dialects* are pure text and always available, so a fragment can be rendered
+# for a database this crate cannot bind for.
+postgres = ["sqlx-cel/postgres"]
+sqlite = ["sqlx-cel/sqlite"]
+mysql = ["sqlx-cel/mysql"]
 
 # Which type `Value::Timestamp` holds. With both on, `chrono` wins -- that is
 # sqlx-cel's rule, not a second one invented here.
