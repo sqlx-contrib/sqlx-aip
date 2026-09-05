@@ -41,7 +41,19 @@ const COLUMNS: Columns<'static> = Columns::new(&[
 /// A schema per test, because `cargo test` runs them concurrently against one
 /// database and they would otherwise all be seeding the same table.
 async fn pool(schema: &str) -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        // Skipping is right on a machine with no Docker, but in CI it would
+        // mean the round trip quietly stopped being tested -- and a skipped
+        // test looks exactly like a passing one. The devcontainer is there
+        // precisely so this cannot happen, so assert it rather than trust it.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "DATABASE_URL is unset in CI: the devcontainer's Postgres never \
+             reached the shell, so these tests would have silently skipped",
+        );
+        eprintln!("skipped: DATABASE_URL is unset");
+        return None;
+    };
 
     let admin = PgPool::connect(&url)
         .await
