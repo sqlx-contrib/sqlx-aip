@@ -7,8 +7,12 @@ use core::fmt;
 /// unmapped path means the same thing about the column map wherever it turns
 /// up, and mapping it to an RPC status is the same judgement call in all three
 /// cases. See [`Error`].
+///
+/// Deliberately *not* `#[non_exhaustive]`: an AIP `List` request has exactly
+/// these three query dimensions, and the crate's scope excludes taking on more,
+/// so a caller mapping them to RPC statuses should get a compile error if that
+/// ever stops being true rather than a `_` arm that silently absorbs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Dimension {
     /// The AIP-160 `filter` expression.
     Filter,

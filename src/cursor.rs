@@ -67,9 +67,7 @@ pub(crate) fn rewrite(
         .map(|(field, value)| bind(field, value))
         .collect::<Result<_, Error>>()?;
 
-    // Asking the dialect rather than naming the three built in, so that a
-    // caller's own `Dialect` is classified correctly too.
-    let positional = dialect.placeholder(param_offset) == dialect.placeholder(param_offset + 1);
+    let positional = is_positional(dialect);
     let mut repeated: Vec<Value> = Vec::new();
 
     let mut sql = String::from("(");
@@ -82,6 +80,10 @@ pub(crate) fn rewrite(
             if term > 0 {
                 sql.push_str(" AND ");
             }
+            // Either way this is the true ordinal of the parameter being
+            // referenced -- the difference is only whether an earlier bind can
+            // be named again, or has to be repeated. A positional dialect
+            // ignores the number, but it is still the honest answer.
             let slot = if positional {
                 repeated.push(keys[term].clone());
                 param_offset + repeated.len() - 1
@@ -111,6 +113,25 @@ pub(crate) fn rewrite(
     sql.push(')');
 
     Ok((Some(sql), if positional { repeated } else { keys }))
+}
+
+/// Whether `dialect` renders every placeholder alike, so that a bind cannot be
+/// referenced twice.
+///
+/// Decided by asking the dialect rather than by naming the three built in, so a
+/// caller's own [`Dialect`] is classified correctly too. It handles the awkward
+/// middle case for free: a dialect emitting SQLite's numbered `?1` / `?2` form
+/// is *positional in syntax but addressable*, renders the two differently, and
+/// is correctly treated as numbered.
+///
+/// This infers a behavioural property from rendered text, which is a smell. The
+/// honest fix is a `Dialect::is_positional` in sqlx-cel, defaulting to exactly
+/// this comparison; until that exists, this is the only signal the trait
+/// offers.
+fn is_positional(dialect: &impl Dialect) -> bool {
+    // Two arbitrary adjacent indices. Any dialect that distinguishes parameters
+    // at all distinguishes these, so rendering them alike means it does not.
+    dialect.placeholder(1) == dialect.placeholder(2)
 }
 
 /// Converts one cursor value into the bind value it compares against.
@@ -197,8 +218,26 @@ mod tests {
     use super::{microseconds, rewrite};
     use crate::error::{Dimension, Error};
     use aip::{CursorValue, OrderBy};
-    use sqlx_cel::dialect::{MySql, Postgres, Sqlite};
+    use sqlx_cel::dialect::{Dialect, MySql, Postgres, Sqlite};
     use sqlx_cel::{Columns, Value};
+
+    /// SQLite's *other* placeholder form. `?1` is positional in syntax but
+    /// still addressable, so a bind can be referenced twice and the values must
+    /// not repeat -- the case a "does it look like `?`" test would get wrong.
+    #[derive(Clone, Copy)]
+    struct NumberedSqlite;
+
+    impl Dialect for NumberedSqlite {
+        fn name(&self) -> &'static str {
+            "sqlite-numbered"
+        }
+        fn placeholder(&self, index: usize) -> String {
+            format!("?{index}")
+        }
+        fn regex(&self, lhs: &str, rhs: &str) -> Option<String> {
+            Some(format!("{lhs} REGEXP {rhs}"))
+        }
+    }
 
     const COLUMNS: Columns<'static> = Columns::new(&[
         ("title", "volumes.title"),
@@ -290,6 +329,30 @@ mod tests {
             Some("((`volumes`.`title` > ?) OR (`volumes`.`title` = ? AND `volumes`.`id` > ?))"),
         );
         assert_eq!(mysql_values, values);
+    }
+
+    /// A dialect can be positional in syntax and still addressable. Deciding by
+    /// asking it to render two indices catches that; deciding by whether the
+    /// placeholder contains a `?` would not.
+    #[test]
+    fn a_numbered_dialect_is_not_treated_as_positional_just_for_using_a_question_mark() {
+        let (sql, values) = rewrite(
+            &order_by("title, id"),
+            &[CursorValue::String("Dune".to_owned()), CursorValue::Int(7)],
+            COLUMNS,
+            &NumberedSqlite,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            sql.as_deref(),
+            Some(concat!(
+                r#"(("volumes"."title" > ?1)"#,
+                r#" OR ("volumes"."title" = ?1 AND "volumes"."id" > ?2))"#,
+            )),
+        );
+        // Two, not three: `?1` names the same bind in both clauses.
+        assert_eq!(values, vec![Value::Text("Dune".to_owned()), Value::Int(7)],);
     }
 
     /// The filter's literals are bound first, so the cursor's placeholders
