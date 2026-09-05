@@ -27,7 +27,7 @@ let query = sqlx_aip::Query {
     columns: VOLUME_COLUMNS,
 };
 
-let sqlx_aip::Rewritten { where_sql, order_sql, values } = query.rewrite()?;
+let sqlx_aip::QueryFragment { where_sql, order_sql, values } = query.rewrite()?;
 ```
 
 ## The three outputs
