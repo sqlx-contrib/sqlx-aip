@@ -32,7 +32,7 @@ use crate::error::{Dimension, Error};
 /// in each of them and is bound once — but a positional `?` has no way to point
 /// backwards, so each one consumes its own bind and the value list repeats.
 /// Three ordering fields bind three values on Postgres and six on SQLite, for
-/// the same predicate.
+/// the same predicate. [`Dialect::is_positional`] is which.
 ///
 /// Getting this wrong does not raise an error. The binds shift by one and the
 /// page silently resumes from the wrong row.
@@ -67,7 +67,7 @@ pub(crate) fn rewrite(
         .map(|(field, value)| bind(field, value))
         .collect::<Result<_, Error>>()?;
 
-    let positional = is_positional(dialect);
+    let positional = dialect.is_positional();
     let mut repeated: Vec<Value> = Vec::new();
 
     let mut sql = String::from("(");
@@ -113,25 +113,6 @@ pub(crate) fn rewrite(
     sql.push(')');
 
     Ok((Some(sql), if positional { repeated } else { keys }))
-}
-
-/// Whether `dialect` renders every placeholder alike, so that a bind cannot be
-/// referenced twice.
-///
-/// Decided by asking the dialect rather than by naming the three built in, so a
-/// caller's own [`Dialect`] is classified correctly too. It handles the awkward
-/// middle case for free: a dialect emitting SQLite's numbered `?1` / `?2` form
-/// is *positional in syntax but addressable*, renders the two differently, and
-/// is correctly treated as numbered.
-///
-/// This infers a behavioural property from rendered text, which is a smell. The
-/// honest fix is a `Dialect::is_positional` in sqlx-cel, defaulting to exactly
-/// this comparison; until that exists, this is the only signal the trait
-/// offers.
-fn is_positional(dialect: &impl Dialect) -> bool {
-    // Two arbitrary adjacent indices. Any dialect that distinguishes parameters
-    // at all distinguishes these, so rendering them alike means it does not.
-    dialect.placeholder(1) == dialect.placeholder(2)
 }
 
 /// Converts one cursor value into the bind value it compares against.
