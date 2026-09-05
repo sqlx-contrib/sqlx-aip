@@ -1,11 +1,11 @@
 //! Rewrites the `filter`, `order_by` and `page_token` of an AIP `List`
-//! request into Postgres SQL fragments, for
+//! request into SQL fragments, for
 //! [sqlx](https://github.com/launchbadge/sqlx).
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use aip::PageToken;
-//! use sqlx_aip::{Columns, Query, QueryFragment};
+//! use sqlx_aip::{Columns, Query, QueryFragment, dialect};
 //!
 //! const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[
 //!     ("name", "volumes.id"),
@@ -21,7 +21,7 @@
 //!     columns: VOLUME_COLUMNS,
 //! };
 //!
-//! let QueryFragment { where_sql, order_sql, values } = query.rewrite()?;
+//! let QueryFragment { where_sql, order_sql, values } = query.rewrite(dialect::Postgres)?;
 //!
 //! assert_eq!(where_sql.as_deref(), Some(r#""volumes"."read_count" > $1"#));
 //! assert_eq!(
@@ -51,7 +51,7 @@
 //! let where_clause = fragment.where_sql.map_or(String::new(), |sql| format!("WHERE {sql}"));
 //! let order_clause = fragment.order_sql.map_or(String::new(), |sql| format!("ORDER BY {sql}"));
 //!
-//! // The values are numbered $1..$N, so the caller's own bindings follow them.
+//! // The values are in bind order, so the caller's own bindings follow them.
 //! let sql = format!(
 //!     "SELECT * FROM volumes {where_clause} {order_clause} LIMIT ${} OFFSET ${}",
 //!     fragment.values.len() + 1,
@@ -63,7 +63,8 @@
 //! `AssertSqlSafe`: the only caller-influenced text in a fragment is column
 //! names, and those come from a fail-closed map rather than from request data.
 //!
-//! ```no_run
+#![cfg_attr(feature = "postgres", doc = "```no_run")]
+#![cfg_attr(not(feature = "postgres"), doc = "```ignore")]
 //! # async fn example(pool: sqlx::PgPool, page_size: i64) -> Result<(), Box<dyn std::error::Error>> {
 //! # let fragment = sqlx_aip::QueryFragment { where_sql: None, order_sql: None, values: Vec::new() };
 //! # let sql = String::new();
@@ -78,6 +79,43 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Dialects
+//!
+//! [`Query::rewrite`] takes the same [`Dialect`] sqlx-cel does, so the SQL is
+//! whatever flavour the caller asks for — see [`dialect`] for what varies.
+//!
+//! One thing does not merely change shape between them. A numbered placeholder
+//! can be referenced from several places and bound once; a positional `?`
+//! cannot, and the key-set predicate pins each more-significant column in every
+//! clause after the first. So the *same* ordering produces a different number
+//! of bind values:
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # use aip::{CursorValue, PageToken};
+//! # use sqlx_aip::{Columns, Query, dialect};
+//! # const COLUMNS: Columns<'static> = Columns::new(&[("title", "title"), ("id", "id")]);
+//! let query = Query {
+//!     filter: None,
+//!     order_by: "title, id".parse()?,
+//!     page_token: PageToken {
+//!         cursor: vec![CursorValue::String("Dune".into()), CursorValue::Int(7)],
+//!         ..PageToken::default()
+//!     },
+//!     columns: COLUMNS,
+//! };
+//!
+//! // ("title" > $1) OR ("title" = $1 AND "id" > $2)
+//! assert_eq!(query.rewrite(dialect::Postgres)?.values.len(), 2);
+//! // ("title" > ?)  OR ("title" = ?  AND "id" > ?)
+//! assert_eq!(query.rewrite(dialect::Sqlite)?.values.len(), 3);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`values`](QueryFragment::values) is always in bind order, so a caller that
+//! hands the whole list to [`BindAll`] never has to know which it got.
 //!
 //! # Stability is the caller's job
 //!
@@ -100,7 +138,7 @@
 //! [`Error::NullCursorValue`] rather than bound. Three things break at once if
 //! it is not: `col > $1` with a NULL bind evaluates to NULL rather than true so
 //! the row is dropped; `col = $1` is NULL too so every clause after the first
-//! is dead; and Postgres's default null ordering does not agree with a
+//! is dead; and a database's default null ordering does not agree with a
 //! null-aware predicate unless the `ORDER BY` carries an explicit
 //! `NULLS FIRST` / `NULLS LAST`, which this crate does not emit. Handling nulls
 //! correctly needs all of that plus a per-column type hint, since a NULL must
@@ -139,12 +177,15 @@ mod order;
 
 pub use error::{Dimension, Error};
 
-// Re-exported so that a caller who takes `values` from a [`QueryFragment`] does not
-// have to add sqlx-cel to their own manifest to name it or bind it.
-pub use sqlx_cel::{BindAll, Columns, Value};
+// Re-exported so that a caller who takes `values` from a [`QueryFragment`] does
+// not have to add sqlx-cel to their own manifest to name one, pick a dialect,
+// or bind the result.
+pub use sqlx_cel::{Columns, Dialect, Value, dialect};
+
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+pub use sqlx_cel::BindAll;
 
 use sqlx_cel::Options;
-use sqlx_cel::dialect;
 
 /// The parsed query dimensions of a `List` request, plus the column map that
 /// resolves their paths.
@@ -156,6 +197,10 @@ use sqlx_cel::dialect;
 /// `order_by` is the *effective* ordering — whatever the client asked for, plus
 /// the tiebreaker the caller appends. See "Stability is the caller's job" in
 /// the crate docs.
+///
+/// The dialect is not part of this: it describes the database being queried,
+/// not the request being served, so it is an argument to
+/// [`rewrite`](Query::rewrite).
 // Not `Clone`: `cel::Program` is not.
 #[derive(Debug)]
 pub struct Query<'a> {
@@ -181,14 +226,14 @@ pub struct Query<'a> {
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// # use aip::{OrderBy, PageToken};
-/// # use sqlx_aip::{Columns, Query, QueryFragment};
+/// # use sqlx_aip::{Columns, Query, QueryFragment, dialect};
 /// # let query = Query {
 /// #     filter: None,
 /// #     order_by: OrderBy::default(),
 /// #     page_token: PageToken::default(),
 /// #     columns: Columns::new(&[("title", "volumes.title")]),
 /// # };
-/// let QueryFragment { where_sql, order_sql, values } = query.rewrite()?;
+/// let QueryFragment { where_sql, order_sql, values } = query.rewrite(dialect::Postgres)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -207,21 +252,22 @@ pub struct QueryFragment {
     /// order, not an error.
     pub order_sql: Option<String>,
 
-    /// The bind values, numbered `$1..$N`: the filter's literals first, then
-    /// the cursor's.
+    /// The bind values, in the order they must be bound: the filter's literals
+    /// first, then the cursor's.
     ///
-    /// The caller's own `LIMIT` / `OFFSET` values follow at `$N+1`.
+    /// The caller's own `LIMIT` / `OFFSET` values follow them. How many there
+    /// are depends on the dialect — see "Dialects" in the crate docs.
     pub values: Vec<Value>,
 }
 
 impl Query<'_> {
-    /// Rewrites the query into its SQL fragments.
+    /// Rewrites the query into SQL fragments in `dialect`'s flavour.
     ///
-    /// The composition order is fixed, because the parameter numbering depends
-    /// on it: the filter is transpiled from `$1`, the cursor predicate is
-    /// numbered after the filter's literals, and the value vectors are
-    /// concatenated in the same order. The filter is parenthesised when it is
-    /// joined to the cursor, because it may be a bare `OR` at the top level.
+    /// The composition order is fixed, because the bind order depends on it:
+    /// the filter is transpiled first, the cursor predicate is numbered after
+    /// the filter's literals, and the value vectors are concatenated to match.
+    /// The filter is parenthesised when it is joined to the cursor, because it
+    /// may be a bare `OR` at the top level.
     ///
     /// # Errors
     ///
@@ -229,14 +275,14 @@ impl Query<'_> {
     /// any of the three dimensions, for a cursor whose length does not match
     /// the ordering, for a null cursor value, and for anything sqlx-cel
     /// rejected in the filter.
-    pub fn rewrite(&self) -> Result<QueryFragment, Error> {
-        // Step 1: the filter, from $1. `Options::default()` is that offset.
+    pub fn rewrite(&self, dialect: impl Dialect) -> Result<QueryFragment, Error> {
+        // Step 1: the filter, from the first placeholder.
         let (filter_sql, mut values) = match &self.filter {
             Some(program) => {
                 let fragment = sqlx_cel::transpile_with(
                     program.expression(),
                     self.columns,
-                    dialect::Postgres,
+                    &dialect,
                     Options::default(),
                 )?;
                 (Some(fragment.sql), fragment.values)
@@ -249,12 +295,13 @@ impl Query<'_> {
             &self.order_by,
             &self.page_token.cursor,
             self.columns,
+            &dialect,
             1 + values.len(),
         )?;
         values.extend(cursor_values);
 
         // Step 3: the ordering, which binds nothing.
-        let order_sql = order::rewrite(&self.order_by, self.columns)?;
+        let order_sql = order::rewrite(&self.order_by, self.columns, &dialect)?;
 
         // Step 4: join. The filter is parenthesised; the cursor predicate
         // brings its own parentheses.
@@ -287,7 +334,7 @@ fn column<'a>(columns: Columns<'a>, path: &str, dimension: Dimension) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Columns, Error, Query, Value};
+    use super::{Columns, Error, Query, Value, dialect};
     use aip::{CursorValue, OrderBy, PageToken};
 
     const COLUMNS: Columns<'static> = Columns::new(&[
@@ -310,7 +357,9 @@ mod tests {
 
     #[test]
     fn no_filter_and_no_cursor_is_no_where_clause() {
-        let fragment = query(None, "title", Vec::new()).rewrite().unwrap();
+        let fragment = query(None, "title", Vec::new())
+            .rewrite(dialect::Postgres)
+            .unwrap();
         assert_eq!(fragment.where_sql, None);
         assert_eq!(
             fragment.order_sql.as_deref(),
@@ -322,7 +371,7 @@ mod tests {
     #[test]
     fn a_filter_alone_is_not_parenthesised() {
         let fragment = query(Some("read_count > 3"), "", Vec::new())
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap();
         assert_eq!(
             fragment.where_sql.as_deref(),
@@ -342,7 +391,7 @@ mod tests {
             "name",
             vec![CursorValue::Int(7)],
         )
-        .rewrite()
+        .rewrite(dialect::Postgres)
         .unwrap();
         assert_eq!(
             fragment.where_sql.as_deref(),
@@ -353,8 +402,8 @@ mod tests {
         );
     }
 
-    /// The composition order is the contract: the filter's literals are $1..$N
-    /// and the cursor's follow, in exactly that order in `values`.
+    /// The composition order is the contract: the filter's literals are bound
+    /// first and the cursor's follow, in exactly that order in `values`.
     #[test]
     fn the_cursors_placeholders_follow_the_filters() {
         let fragment = query(
@@ -362,7 +411,7 @@ mod tests {
             "title, name",
             vec![CursorValue::String("Emma".to_owned()), CursorValue::Int(7)],
         )
-        .rewrite()
+        .rewrite(dialect::Postgres)
         .unwrap();
         assert_eq!(
             fragment.where_sql.as_deref(),
@@ -383,10 +432,41 @@ mod tests {
         );
     }
 
+    /// The same query on a positional dialect: identical value *order*, but the
+    /// cursor's repeat because a `?` cannot point back at an earlier bind.
+    #[test]
+    fn a_positional_dialect_keeps_bind_order_and_repeats_what_it_must() {
+        let fragment = query(
+            Some(r#"read_count > 3 && title != "Dune""#),
+            "title, name",
+            vec![CursorValue::String("Emma".to_owned()), CursorValue::Int(7)],
+        )
+        .rewrite(dialect::Sqlite)
+        .unwrap();
+        assert_eq!(
+            fragment.where_sql.as_deref(),
+            Some(concat!(
+                r#"(("volumes"."read_count" > ? AND "volumes"."title" != ?))"#,
+                r#" AND (("volumes"."title" > ?)"#,
+                r#" OR ("volumes"."title" = ? AND "volumes"."id" > ?))"#,
+            )),
+        );
+        assert_eq!(
+            fragment.values,
+            vec![
+                Value::Int(3),
+                Value::Text("Dune".to_owned()),
+                Value::Text("Emma".to_owned()),
+                Value::Text("Emma".to_owned()),
+                Value::Int(7),
+            ],
+        );
+    }
+
     #[test]
     fn a_cursor_alone_is_the_whole_where_clause() {
         let fragment = query(None, "name", vec![CursorValue::Int(7)])
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap();
         assert_eq!(
             fragment.where_sql.as_deref(),
@@ -400,7 +480,7 @@ mod tests {
     #[test]
     fn an_unmapped_filter_path_never_reaches_sql() {
         let error = query(Some(r#"internal_notes == "secret""#), "", Vec::new())
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap_err();
         assert_eq!(
             error,
@@ -415,7 +495,7 @@ mod tests {
     #[test]
     fn an_untranslatable_filter_is_wrapped() {
         let error = query(Some("read_count + 1 > 3"), "", Vec::new())
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap_err();
         assert!(matches!(error, Error::Filter(_)), "{error:?}");
         assert!(core::error::Error::source(&error).is_some());
@@ -427,7 +507,7 @@ mod tests {
     fn the_tokens_offset_is_not_consulted() {
         let mut query = query(None, "name", Vec::new());
         query.page_token.offset = 250;
-        let fragment = query.rewrite().unwrap();
+        let fragment = query.rewrite(dialect::Postgres).unwrap();
         assert_eq!(fragment.where_sql, None);
         assert_eq!(fragment.values, Vec::new());
     }
@@ -435,7 +515,7 @@ mod tests {
     #[test]
     fn a_cursor_issued_under_a_different_ordering_is_rejected() {
         let error = query(None, "title, name", vec![CursorValue::Int(7)])
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap_err();
         assert_eq!(
             error,
@@ -451,7 +531,7 @@ mod tests {
     #[test]
     fn an_empty_ordering_cannot_carry_a_cursor() {
         let error = query(None, "", vec![CursorValue::Int(7)])
-            .rewrite()
+            .rewrite(dialect::Postgres)
             .unwrap_err();
         assert_eq!(
             error,
@@ -471,6 +551,6 @@ mod tests {
             page_token: PageToken::default(),
             columns: Columns::default(),
         };
-        assert!(query.rewrite().is_err());
+        assert!(query.rewrite(dialect::Postgres).is_err());
     }
 }

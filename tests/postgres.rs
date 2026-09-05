@@ -13,12 +13,14 @@
 //! DATABASE_URL=postgres://localhost/sqlx_aip_test cargo test --test postgres
 //! ```
 
+#![cfg(feature = "postgres")]
+
 use std::str::FromStr as _;
 
 use aip::{CursorValue, OrderBy, PageToken};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
-use sqlx_aip::{BindAll, Columns, Query, QueryFragment, Value};
+use sqlx_aip::{BindAll, Columns, Query, QueryFragment, Value, dialect};
 
 /// `name` is the AIP resource-name field, and maps to the primary key. It is
 /// the tiebreaker every ordering in these tests ends with.
@@ -126,7 +128,7 @@ async fn page(pool: &PgPool, query: &Query<'_>, page_size: i64) -> Vec<i64> {
         where_sql,
         order_sql,
         values,
-    } = query.rewrite().expect("must rewrite");
+    } = query.rewrite(dialect::Postgres).expect("must rewrite");
 
     let where_clause = where_sql.map_or(String::new(), |sql| format!("WHERE {sql}"));
     let order_clause = order_sql.map_or(String::new(), |sql| format!("ORDER BY {sql}"));
@@ -372,7 +374,7 @@ async fn an_unmapped_column_never_reaches_the_database() {
     // Naming the column rather than the path is exactly the probe the map has
     // to refuse.
     assert!(matches!(
-        query.rewrite().unwrap_err(),
+        query.rewrite(dialect::Postgres).unwrap_err(),
         sqlx_aip::Error::UnknownField { .. },
     ));
 }

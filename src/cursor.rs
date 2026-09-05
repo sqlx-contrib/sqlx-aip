@@ -1,7 +1,7 @@
 use core::fmt::Write as _;
 
 use aip::{CursorValue, OrderBy, OrderByField};
-use sqlx_cel::dialect::{Dialect, Postgres};
+use sqlx_cel::dialect::Dialect;
 use sqlx_cel::{Columns, Value};
 
 use crate::column;
@@ -24,10 +24,23 @@ use crate::error::{Dimension, Error};
 ///
 /// Returns `(None, vec![])` for an empty cursor — the first page emits
 /// nothing, binds nothing, and is not an error.
+///
+/// # Why the value list depends on the dialect
+///
+/// Every clause but the first pins the more-significant columns to values an
+/// earlier clause already referenced. A numbered dialect says so — `$1` appears
+/// in each of them and is bound once — but a positional `?` has no way to point
+/// backwards, so each one consumes its own bind and the value list repeats.
+/// Three ordering fields bind three values on Postgres and six on SQLite, for
+/// the same predicate.
+///
+/// Getting this wrong does not raise an error. The binds shift by one and the
+/// page silently resumes from the wrong row.
 pub(crate) fn rewrite(
     order_by: &OrderBy,
     cursor: &[CursorValue],
     columns: Columns<'_>,
+    dialect: &impl Dialect,
     param_offset: usize,
 ) -> Result<(Option<String>, Vec<Value>), Error> {
     if cursor.is_empty() {
@@ -45,14 +58,19 @@ pub(crate) fn rewrite(
         .iter()
         .map(|field| {
             let column = column(columns, &field.path, Dimension::Cursor)?;
-            Ok(Postgres.quote_ident(column))
+            Ok(dialect.quote_ident(column))
         })
         .collect::<Result<_, Error>>()?;
-    let values: Vec<Value> = fields
+    let keys: Vec<Value> = fields
         .iter()
         .zip(cursor)
         .map(|(field, value)| bind(field, value))
         .collect::<Result<_, Error>>()?;
+
+    // Asking the dialect rather than naming the three built in, so that a
+    // caller's own `Dialect` is classified correctly too.
+    let positional = dialect.placeholder(param_offset) == dialect.placeholder(param_offset + 1);
+    let mut repeated: Vec<Value> = Vec::new();
 
     let mut sql = String::from("(");
     for (index, field) in fields.iter().enumerate() {
@@ -60,20 +78,39 @@ pub(crate) fn rewrite(
             sql.push_str(" OR ");
         }
         sql.push('(');
-        // The equality prefix: every more-significant column pinned to its
-        // cursor value, so this clause only decides ties the earlier ones left.
-        for (prefix, column) in quoted.iter().enumerate().take(index) {
-            let placeholder = Postgres.placeholder(param_offset + prefix);
-            write!(sql, "{column} = {placeholder} AND ").expect("a String cannot fail");
+        for term in 0..=index {
+            if term > 0 {
+                sql.push_str(" AND ");
+            }
+            let slot = if positional {
+                repeated.push(keys[term].clone());
+                param_offset + repeated.len() - 1
+            } else {
+                param_offset + term
+            };
+            // Every term but the last pins a more-significant column to its
+            // cursor value, so this clause only decides ties the earlier ones
+            // left open.
+            let operator = if term < index {
+                "="
+            } else if field.desc {
+                "<"
+            } else {
+                ">"
+            };
+            write!(
+                sql,
+                "{} {operator} {}",
+                quoted[term],
+                dialect.placeholder(slot)
+            )
+            .expect("a String cannot fail");
         }
-        let operator = if field.desc { '<' } else { '>' };
-        let placeholder = Postgres.placeholder(param_offset + index);
-        write!(sql, "{} {operator} {placeholder}", quoted[index]).expect("a String cannot fail");
         sql.push(')');
     }
     sql.push(')');
 
-    Ok((Some(sql), values))
+    Ok((Some(sql), if positional { repeated } else { keys }))
 }
 
 /// Converts one cursor value into the bind value it compares against.
@@ -107,7 +144,7 @@ fn bind(field: &OrderByField, value: &CursorValue) -> Result<Value, Error> {
 
 /// Rounds a signed nanosecond count to microseconds, half away from zero.
 ///
-/// Postgres intervals have microsecond resolution, so the sub-microsecond part
+/// A Postgres interval has microsecond resolution, so the sub-microsecond part
 /// of a `google.protobuf.Duration` has nowhere to go. Rounding rather than
 /// truncating matches how sqlx-cel parses a `duration("…")` literal, which is
 /// what the cursor value is compared against.
@@ -160,6 +197,7 @@ mod tests {
     use super::{microseconds, rewrite};
     use crate::error::{Dimension, Error};
     use aip::{CursorValue, OrderBy};
+    use sqlx_cel::dialect::{MySql, Postgres, Sqlite};
     use sqlx_cel::{Columns, Value};
 
     const COLUMNS: Columns<'static> = Columns::new(&[
@@ -178,7 +216,14 @@ mod tests {
     /// inspecting its shape.
     #[test]
     fn a_single_ascending_field_is_one_comparison() {
-        let (sql, values) = rewrite(&order_by("id"), &[CursorValue::Int(7)], COLUMNS, 1).unwrap();
+        let (sql, values) = rewrite(
+            &order_by("id"),
+            &[CursorValue::Int(7)],
+            COLUMNS,
+            &Postgres,
+            1,
+        )
+        .unwrap();
         assert_eq!(sql.as_deref(), Some(r#"(("volumes"."id" > $1))"#));
         assert_eq!(values, vec![Value::Int(7)]);
     }
@@ -195,6 +240,7 @@ mod tests {
                 CursorValue::Int(7),
             ],
             COLUMNS,
+            &Postgres,
             1,
         )
         .unwrap();
@@ -211,6 +257,41 @@ mod tests {
         assert_eq!(values[0], Value::Text("Dune".to_owned()));
     }
 
+    /// A positional dialect cannot point back at an earlier bind, so every `?`
+    /// gets its own -- three fields bind six values, not three. Off-by-one here
+    /// resumes the page from the wrong row rather than raising anything.
+    #[test]
+    fn a_positional_dialect_repeats_the_values_its_placeholders_cannot_share() {
+        let cursor = [CursorValue::String("Dune".to_owned()), CursorValue::Int(7)];
+        let (sql, values) = rewrite(&order_by("title, id"), &cursor, COLUMNS, &Sqlite, 1).unwrap();
+        assert_eq!(
+            sql.as_deref(),
+            Some(concat!(
+                r#"(("volumes"."title" > ?)"#,
+                r#" OR ("volumes"."title" = ? AND "volumes"."id" > ?))"#,
+            )),
+        );
+        // Three placeholders, so three values -- the title twice, in the order
+        // the `?`s consume them.
+        assert_eq!(
+            values,
+            vec![
+                Value::Text("Dune".to_owned()),
+                Value::Text("Dune".to_owned()),
+                Value::Int(7),
+            ],
+        );
+
+        // MySQL is positional too, and differs only in how it quotes.
+        let (sql, mysql_values) =
+            rewrite(&order_by("title, id"), &cursor, COLUMNS, &MySql, 1).unwrap();
+        assert_eq!(
+            sql.as_deref(),
+            Some("((`volumes`.`title` > ?) OR (`volumes`.`title` = ? AND `volumes`.`id` > ?))"),
+        );
+        assert_eq!(mysql_values, values);
+    }
+
     /// The filter's literals are bound first, so the cursor's placeholders
     /// start after them.
     #[test]
@@ -219,6 +300,7 @@ mod tests {
             &order_by("title, id"),
             &[CursorValue::String("Dune".to_owned()), CursorValue::Int(7)],
             COLUMNS,
+            &Postgres,
             4,
         )
         .unwrap();
@@ -234,13 +316,13 @@ mod tests {
     #[test]
     fn an_empty_cursor_is_the_first_page() {
         assert_eq!(
-            rewrite(&order_by("title"), &[], COLUMNS, 1).unwrap(),
+            rewrite(&order_by("title"), &[], COLUMNS, &Postgres, 1).unwrap(),
             (None, Vec::new()),
         );
         // Even with no ordering at all: nothing to resume from is not a
         // mismatch.
         assert_eq!(
-            rewrite(&OrderBy::default(), &[], COLUMNS, 1).unwrap(),
+            rewrite(&OrderBy::default(), &[], COLUMNS, &Postgres, 1).unwrap(),
             (None, Vec::new()),
         );
     }
@@ -258,7 +340,7 @@ mod tests {
             ("", vec![CursorValue::Int(7)], 0, 1),
         ] {
             assert_eq!(
-                rewrite(&order_by(spec), &cursor, COLUMNS, 1).unwrap_err(),
+                rewrite(&order_by(spec), &cursor, COLUMNS, &Postgres, 1).unwrap_err(),
                 Error::CursorArity { fields, values },
                 "for order_by {spec:?}",
             );
@@ -272,6 +354,7 @@ mod tests {
                 &order_by("title, id"),
                 &[CursorValue::String("Dune".to_owned()), CursorValue::Null],
                 COLUMNS,
+                &Postgres,
                 1,
             )
             .unwrap_err(),
@@ -284,7 +367,14 @@ mod tests {
     #[test]
     fn a_path_outside_the_column_map_fails_as_the_cursor_dimension() {
         assert_eq!(
-            rewrite(&order_by("shoe_size"), &[CursorValue::Int(7)], COLUMNS, 1,).unwrap_err(),
+            rewrite(
+                &order_by("shoe_size"),
+                &[CursorValue::Int(7)],
+                COLUMNS,
+                &Postgres,
+                1,
+            )
+            .unwrap_err(),
             Error::UnknownField {
                 dimension: Dimension::Cursor,
                 path: "shoe_size".to_owned(),
@@ -328,8 +418,14 @@ mod tests {
             ("g", "g"),
             ("h", "h"),
         ]);
-        let (_, values) =
-            rewrite(&order_by("a, b, c, d, e, f, g, h"), &cursor, columns, 1).unwrap();
+        let (_, values) = rewrite(
+            &order_by("a, b, c, d, e, f, g, h"),
+            &cursor,
+            columns,
+            &Postgres,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(values[0], Value::Bool(true));
         assert_eq!(values[1], Value::Text("Dune".to_owned()));
@@ -352,6 +448,7 @@ mod tests {
                 nanos: 0,
             }],
             COLUMNS,
+            &Postgres,
             1,
         )
         .unwrap_err();
