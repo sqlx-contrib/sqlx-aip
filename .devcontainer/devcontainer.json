@@ -1,18 +1,47 @@
 {
   "$schema": "https://raw.githubusercontent.com/devcontainers/spec/refs/heads/main/schemas/devContainer.base.schema.json",
   "name": "sqlx-aip",
-  "image": "mcr.microsoft.com/devcontainers/base:bookworm",
-  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "service": "workspace",
+  "dockerComposeFile": "docker-compose.yml",
+  "workspaceFolder": "/home/vscode/workspace",
+  "features": {
+    "ghcr.io/devcontainers/features/nix:1": {
+      // Single-user install. The feature defaults to multiUser, which runs
+      // post-install steps through the nix-daemon — but a Docker build layer
+      // has no init system to start one, so those steps fail with
+      // "opening lock file /nix/var/nix/db/big-lock: Permission denied".
+      // A single-user store owned by vscode needs no daemon, and is what the
+      // /nix volume and the postStartCommand chown below already assume.
+      "multiUser": false,
+      "extraNixConfig": "experimental-features = nix-command flakes"
+    }
+  },
+  // The single definition of the test database. Inside the container this
+  // resolves over the compose network; on the host, `devcontainer-env export`
+  // rewrites it to the port Docker assigned. `containerEnv` rather than
+  // `remoteEnv` because only the former applies to every process, which is
+  // what devcontainer-env reads.
+  "containerEnv": {
+    "DATABASE_URL": "postgres://vscode@postgres:5432/sqlx_aip_test?sslmode=disable"
+  },
   "mounts": [
     "source=${localWorkspaceFolderBasename}-nix,target=/nix,type=volume",
     "source=${localWorkspaceFolderBasename}-cache,target=/home/vscode/.cache,type=volume",
     "source=${localWorkspaceFolderBasename}-cargo,target=/home/vscode/.cargo,type=volume",
-    "source=${localWorkspaceFolderBasename}-target,target=/workspaces/${localWorkspaceFolderBasename}/target,type=volume"
+    "source=${localWorkspaceFolderBasename}-target,target=/home/vscode/workspace/target,type=volume"
   ],
-  "features": {
-    "ghcr.io/devcontainers/features/nix:1": {
-      "extraNixConfig": "experimental-features = nix-command flakes"
+  "postStartCommand": "sudo chown vscode:vscode /nix /home/vscode/.cache /home/vscode/.cargo /home/vscode/workspace/target",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "default",
+        "terminal.integrated.profiles.linux": {
+          "default": {
+            "path": "nix",
+            "args": ["develop"]
+          }
+        }
+      }
     }
-  },
-  "postCreateCommand": "sudo chown -R vscode:vscode /nix /home/vscode/.cache /home/vscode/.cargo /workspaces/${localWorkspaceFolderBasename}/target"
+  }
 }
