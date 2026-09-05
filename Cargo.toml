@@ -1,6 +1,6 @@
 [package]
 name = "sqlx-aip"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 # Not a choice: sqlx 0.9 declares it. See sqlx-cel's docs/values.md.
 rust-version = "1.94"
