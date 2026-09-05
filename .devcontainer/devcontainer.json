@@ -27,10 +27,13 @@
   "mounts": [
     "source=${localWorkspaceFolderBasename}-nix,target=/nix,type=volume",
     "source=${localWorkspaceFolderBasename}-cache,target=/home/vscode/.cache,type=volume",
-    "source=${localWorkspaceFolderBasename}-cargo,target=/home/vscode/.cargo,type=volume",
-    "source=${localWorkspaceFolderBasename}-target,target=/home/vscode/workspace/target,type=volume"
+    "source=${localWorkspaceFolderBasename}-cargo,target=/home/vscode/.cargo,type=volume"
   ],
-  "postStartCommand": "sudo chown vscode:vscode /nix /home/vscode/.cache /home/vscode/.cargo /home/vscode/workspace/target",
+  // Every volume stays *outside* the workspace. Mounting one at
+  // workspace/target would create that directory inside the bind mount, owned
+  // by the container's uid -- and CI runs cargo on the runner itself, where
+  // that is a different uid and `target/` becomes unwritable.
+  "postStartCommand": "sudo chown vscode:vscode /nix /home/vscode/.cache /home/vscode/.cargo",
   "customizations": {
     "vscode": {
       "settings": {
