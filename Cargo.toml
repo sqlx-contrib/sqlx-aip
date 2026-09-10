@@ -5,7 +5,7 @@ edition = "2024"
 # Not a choice: sqlx 0.9 declares it. See sqlx-cel's docs/values.md.
 rust-version = "1.94"
 license = "MIT"
-description = "Rewrites an AIP List request's filter, order_by and page_token into SQL fragments, for sqlx."
+description = "Renders an AIP List request's filter, order_by and page_token into SQL fragments, for sqlx."
 repository = "https://github.com/sqlx-contrib/sqlx-aip"
 keywords = ["aip", "sqlx", "postgres", "sqlite", "pagination"]
 categories = ["database"]

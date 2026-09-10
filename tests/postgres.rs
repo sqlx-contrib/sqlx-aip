@@ -20,7 +20,7 @@ use std::str::FromStr as _;
 use aip::{CursorValue, OrderBy, PageToken};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{AssertSqlSafe, PgPool, Row};
-use sqlx_aip::{BindAll, Columns, Query, QueryFragment, Value, dialect};
+use sqlx_aip::{BindAll, Columns, Query, QueryFragment, QueryRenderer, Value, dialect};
 
 /// `name` is the AIP resource-name field, and maps to the primary key. It is
 /// the tiebreaker every ordering in these tests ends with.
@@ -34,6 +34,10 @@ const COLUMNS: Columns<'static> = Columns::new(&[
     ("create_time", "volumes.created_at"),
     ("duration", "volumes.duration"),
 ]);
+
+/// The renderer under test: one dialect, one column map, stated once.
+const RENDERER: QueryRenderer<'static, dialect::Postgres> =
+    QueryRenderer::new(dialect::Postgres).columns(COLUMNS);
 
 /// Creates `schema`, seeds `volumes` inside it, and returns a pool whose
 /// `search_path` points there. Returns `None` when `DATABASE_URL` is unset.
@@ -135,12 +139,12 @@ macro_rules! pool {
 }
 
 /// Runs one page of a `List` request and returns the ids it served.
-async fn page(pool: &PgPool, query: &Query<'_>, page_size: i64) -> Vec<i64> {
+async fn page(pool: &PgPool, query: &Query, page_size: i64) -> Vec<i64> {
     let QueryFragment {
         where_sql,
         order_sql,
         values,
-    } = query.rewrite(dialect::Postgres).expect("must rewrite");
+    } = RENDERER.render(query).expect("must render");
 
     let where_clause = where_sql.map_or(String::new(), |sql| format!("WHERE {sql}"));
     let order_clause = order_sql.map_or(String::new(), |sql| format!("ORDER BY {sql}"));
@@ -196,7 +200,6 @@ async fn pages_through_a_non_unique_sort_column_exactly_once() {
             filter: None,
             order_by: order_by.clone(),
             page_token: token.clone(),
-            columns: COLUMNS,
         };
         let ids = page(&pool, &query, 3).await;
         if ids.is_empty() {
@@ -228,7 +231,6 @@ async fn pages_through_a_descending_column_exactly_once() {
             filter: None,
             order_by: order_by.clone(),
             page_token: token.clone(),
-            columns: COLUMNS,
         };
         let ids = page(&pool, &query, 3).await;
         if ids.is_empty() {
@@ -261,7 +263,6 @@ async fn a_filter_and_a_cursor_share_one_placeholder_sequence() {
             filter: Some(filter()),
             order_by: order_by.clone(),
             page_token: PageToken::default(),
-            columns: COLUMNS,
         },
         2,
     )
@@ -277,7 +278,6 @@ async fn a_filter_and_a_cursor_share_one_placeholder_sequence() {
             filter: Some(filter()),
             order_by: order_by.clone(),
             page_token: token,
-            columns: COLUMNS,
         },
         10,
     )
@@ -303,7 +303,6 @@ async fn a_top_level_or_in_the_filter_stays_parenthesised() {
             filter: Some(cel::Program::compile(r#"read_count > 8 || title == "Dune""#).unwrap()),
             order_by,
             page_token: token,
-            columns: COLUMNS,
         },
         10,
     )
@@ -353,7 +352,6 @@ async fn every_cursor_value_variant_encodes() {
             cursor: vec![CursorValue::timestamp(1_704_585_600, 0)],
             ..PageToken::default()
         },
-        columns: COLUMNS,
     };
     assert_eq!(page(&pool, &query, 10).await, vec![7, 8]);
 
@@ -380,13 +378,12 @@ async fn an_unmapped_column_never_reaches_the_database() {
         filter: Some(cel::Program::compile(r#"created_at == "x""#).unwrap()),
         order_by: OrderBy::default(),
         page_token: PageToken::default(),
-        columns: COLUMNS,
     };
     // `created_at` is the *column*; `create_time` is the path that maps to it.
     // Naming the column rather than the path is exactly the probe the map has
     // to refuse.
     assert!(matches!(
-        query.rewrite(dialect::Postgres).unwrap_err(),
+        RENDERER.render(&query).unwrap_err(),
         sqlx_aip::Error::UnknownField { .. },
     ));
 }

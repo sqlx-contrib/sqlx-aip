@@ -36,7 +36,7 @@ use crate::error::{Dimension, Error};
 ///
 /// Getting this wrong does not raise an error. The binds shift by one and the
 /// page silently resumes from the wrong row.
-pub(crate) fn rewrite(
+pub(crate) fn render(
     order_by: &OrderBy,
     cursor: &[CursorValue],
     columns: Columns<'_>,
@@ -196,7 +196,7 @@ fn timestamp(field: &OrderByField, seconds: i64, nanos: i32) -> Result<Value, Er
 
 #[cfg(test)]
 mod tests {
-    use super::{microseconds, rewrite};
+    use super::{microseconds, render};
     use crate::error::{Dimension, Error};
     use aip::{CursorValue, OrderBy};
     use sqlx_cel::dialect::{Dialect, MySql, Postgres, Sqlite};
@@ -232,11 +232,11 @@ mod tests {
 
     /// The one-field case keeps both sets of parentheses -- the per-clause pair
     /// and the wrapper around the `OR` chain. Redundant here, but the wrapper
-    /// is what lets `rewrite` `AND` a filter onto the predicate without
+    /// is what lets `render` `AND` a filter onto the predicate without
     /// inspecting its shape.
     #[test]
     fn a_single_ascending_field_is_one_comparison() {
-        let (sql, values) = rewrite(
+        let (sql, values) = render(
             &order_by("id"),
             &[CursorValue::Int(7)],
             COLUMNS,
@@ -252,7 +252,7 @@ mod tests {
     /// and an operator that follows each field's own direction.
     #[test]
     fn each_field_carries_its_own_direction() {
-        let (sql, values) = rewrite(
+        let (sql, values) = render(
             &order_by("title, create_time desc, id"),
             &[
                 CursorValue::String("Dune".to_owned()),
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn a_positional_dialect_repeats_the_values_its_placeholders_cannot_share() {
         let cursor = [CursorValue::String("Dune".to_owned()), CursorValue::Int(7)];
-        let (sql, values) = rewrite(&order_by("title, id"), &cursor, COLUMNS, &Sqlite, 1).unwrap();
+        let (sql, values) = render(&order_by("title, id"), &cursor, COLUMNS, &Sqlite, 1).unwrap();
         assert_eq!(
             sql.as_deref(),
             Some(concat!(
@@ -304,7 +304,7 @@ mod tests {
 
         // MySQL is positional too, and differs only in how it quotes.
         let (sql, mysql_values) =
-            rewrite(&order_by("title, id"), &cursor, COLUMNS, &MySql, 1).unwrap();
+            render(&order_by("title, id"), &cursor, COLUMNS, &MySql, 1).unwrap();
         assert_eq!(
             sql.as_deref(),
             Some("((`volumes`.`title` > ?) OR (`volumes`.`title` = ? AND `volumes`.`id` > ?))"),
@@ -317,7 +317,7 @@ mod tests {
     /// placeholder contains a `?` would not.
     #[test]
     fn a_numbered_dialect_is_not_treated_as_positional_just_for_using_a_question_mark() {
-        let (sql, values) = rewrite(
+        let (sql, values) = render(
             &order_by("title, id"),
             &[CursorValue::String("Dune".to_owned()), CursorValue::Int(7)],
             COLUMNS,
@@ -340,7 +340,7 @@ mod tests {
     /// start after them.
     #[test]
     fn placeholders_start_at_the_offset() {
-        let (sql, _) = rewrite(
+        let (sql, _) = render(
             &order_by("title, id"),
             &[CursorValue::String("Dune".to_owned()), CursorValue::Int(7)],
             COLUMNS,
@@ -360,13 +360,13 @@ mod tests {
     #[test]
     fn an_empty_cursor_is_the_first_page() {
         assert_eq!(
-            rewrite(&order_by("title"), &[], COLUMNS, &Postgres, 1).unwrap(),
+            render(&order_by("title"), &[], COLUMNS, &Postgres, 1).unwrap(),
             (None, Vec::new()),
         );
         // Even with no ordering at all: nothing to resume from is not a
         // mismatch.
         assert_eq!(
-            rewrite(&OrderBy::default(), &[], COLUMNS, &Postgres, 1).unwrap(),
+            render(&OrderBy::default(), &[], COLUMNS, &Postgres, 1).unwrap(),
             (None, Vec::new()),
         );
     }
@@ -384,7 +384,7 @@ mod tests {
             ("", vec![CursorValue::Int(7)], 0, 1),
         ] {
             assert_eq!(
-                rewrite(&order_by(spec), &cursor, COLUMNS, &Postgres, 1).unwrap_err(),
+                render(&order_by(spec), &cursor, COLUMNS, &Postgres, 1).unwrap_err(),
                 Error::CursorArity { fields, values },
                 "for order_by {spec:?}",
             );
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn a_null_cursor_value_is_rejected_rather_than_bound() {
         assert_eq!(
-            rewrite(
+            render(
                 &order_by("title, id"),
                 &[CursorValue::String("Dune".to_owned()), CursorValue::Null],
                 COLUMNS,
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn a_path_outside_the_column_map_fails_as_the_cursor_dimension() {
         assert_eq!(
-            rewrite(
+            render(
                 &order_by("shoe_size"),
                 &[CursorValue::Int(7)],
                 COLUMNS,
@@ -462,7 +462,7 @@ mod tests {
             ("g", "g"),
             ("h", "h"),
         ]);
-        let (_, values) = rewrite(
+        let (_, values) = render(
             &order_by("a, b, c, d, e, f, g, h"),
             &cursor,
             columns,
@@ -485,7 +485,7 @@ mod tests {
     /// request alone, so an absurd timestamp is reachable and must not panic.
     #[test]
     fn a_timestamp_outside_the_backend_range_is_an_error() {
-        let error = rewrite(
+        let error = render(
             &order_by("create_time"),
             &[CursorValue::Timestamp {
                 seconds: i64::MAX,
