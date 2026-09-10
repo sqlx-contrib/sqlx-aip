@@ -80,6 +80,35 @@
 //! # }
 //! ```
 //!
+//! # Splicing into a query that already binds
+//!
+//! Above, the fragment's placeholders come first and the caller's `LIMIT` and
+//! `OFFSET` follow them. The other arrangement is at least as common — a
+//! generated query with its own parameters, and a filter spliced into a
+//! sentinel comment somewhere in the middle of it — and for that, tell
+//! [`rewrite_with`](Query::rewrite_with) where to start:
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # use sqlx_aip::{Columns, Options, Query, dialect};
+//! # const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[("read_count", "read_count")]);
+//! # let query = Query { filter: Some(cel::Program::compile("read_count > 3")?), columns: VOLUME_COLUMNS, ..Default::default() };
+//! // The query binds $1 and $2 already, so the fragment starts at $3.
+//! let fragment = query.rewrite_with(
+//!     dialect::Postgres,
+//!     Options { param_offset: 3, ..Default::default() },
+//! )?;
+//!
+//! assert_eq!(fragment.where_sql.as_deref(), Some(r#""read_count" > $3"#));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The alternative is renumbering the fragment after the fact, which means
+//! scanning SQL for `$N` while stepping over the string literals a `LIKE`
+//! fragment carries. Nobody should have to write that scanner to paginate a
+//! table, so the offset exists to make sure nobody does.
+//!
 //! # Dialects
 //!
 //! [`Query::rewrite`] takes the same [`Dialect`] sqlx-cel does, so the SQL is
@@ -180,12 +209,10 @@ pub use error::{Dimension, Error};
 // Re-exported so that a caller who takes `values` from a [`QueryFragment`] does
 // not have to add sqlx-cel to their own manifest to name one, pick a dialect,
 // or bind the result.
-pub use sqlx_cel::{Columns, Dialect, Value, dialect};
+pub use sqlx_cel::{Columns, Dialect, Options, Value, dialect};
 
 #[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
 pub use sqlx_cel::BindAll;
-
-use sqlx_cel::Options;
 
 /// The parsed query dimensions of a `List` request, plus the column map that
 /// resolves their paths.
@@ -295,6 +322,65 @@ impl Query<'_> {
     /// the ordering, for a null cursor value, and for anything sqlx-cel
     /// rejected in the filter.
     pub fn rewrite(&self, dialect: impl Dialect) -> Result<QueryFragment, Error> {
+        self.rewrite_with(dialect, Options::default())
+    }
+
+    /// [`rewrite`](Query::rewrite), with control over where placeholder
+    /// numbering starts.
+    ///
+    /// [`Options::param_offset`] is the number of the first placeholder the
+    /// fragments emit, so `4` numbers them `$4`, `$5`, … and the result splices
+    /// into a query that already binds three parameters of its own. Without it
+    /// a caller has to renumber the fragment itself, which means scanning SQL
+    /// for `$N` while stepping over the string literals a `LIKE` fragment
+    /// carries — a scanner nobody should have to write to paginate a table.
+    ///
+    /// The offset shifts the filter and the cursor together, and the cursor
+    /// still follows the filter's literals, so
+    /// [`values`](QueryFragment::values) is in bind order exactly as it is from
+    /// [`rewrite`](Query::rewrite). The caller binds its own parameters first
+    /// and the fragment's after them.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use sqlx_aip::{Columns, Options, Query, dialect};
+    /// # const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[("read_count", "read_count")]);
+    /// let query = Query {
+    ///     filter: Some(cel::Program::compile("read_count > 3")?),
+    ///     columns: VOLUME_COLUMNS,
+    ///     ..Default::default()
+    /// };
+    ///
+    /// let fragment = query
+    ///     .rewrite_with(dialect::Postgres, Options { param_offset: 3, ..Default::default() })?;
+    ///
+    /// assert_eq!(fragment.where_sql.as_deref(), Some(r#""read_count" > $3"#));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Positional dialects
+    ///
+    /// A `?` carries no number, so SQLite and MySQL ignore the offset — but
+    /// bind order still decides which value lands where, and there it follows
+    /// the *text*. A fragment spliced into the middle of such a query has to
+    /// have its values bound in the middle too, which is a constraint numbered
+    /// placeholders do not impose. [`Dialect::is_positional`] is how a caller
+    /// asks which it is dealing with.
+    ///
+    /// # Errors
+    ///
+    /// As [`rewrite`](Query::rewrite).
+    pub fn rewrite_with(
+        &self,
+        dialect: impl Dialect,
+        options: Options,
+    ) -> Result<QueryFragment, Error> {
+        // As sqlx-cel does with the same field, and for the same reason: there
+        // is no `$0`. Read here as well as there because the cursor's offset is
+        // computed from it rather than passed through.
+        let offset = options.param_offset.max(1);
+
         // Step 1: the filter, from the first placeholder.
         let (filter_sql, mut values) = match &self.filter {
             Some(program) => {
@@ -302,7 +388,7 @@ impl Query<'_> {
                     program.expression(),
                     self.columns,
                     &dialect,
-                    Options::default(),
+                    options,
                 )?;
                 (Some(fragment.sql), fragment.values)
             }
@@ -315,7 +401,7 @@ impl Query<'_> {
             &self.page_token.cursor,
             self.columns,
             &dialect,
-            1 + values.len(),
+            offset + values.len(),
         )?;
         values.extend(cursor_values);
 
@@ -353,7 +439,7 @@ fn column<'a>(columns: Columns<'a>, path: &str, dimension: Dimension) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Columns, Error, Query, Value, dialect};
+    use super::{Columns, Error, Options, Query, Value, dialect};
     use aip::{CursorValue, OrderBy, PageToken};
 
     const COLUMNS: Columns<'static> = Columns::new(&[
@@ -449,6 +535,90 @@ mod tests {
                 Value::Int(7),
             ],
         );
+    }
+
+    /// Where a test's fragments start numbering.
+    ///
+    /// A struct literal rather than `..Options::default()`, which this crate's
+    /// pedantic clippy rejects while [`Options`] has one field: the update would
+    /// have no effect. One construction site, so a second field is one edit.
+    fn offset(param_offset: usize) -> Options {
+        Options { param_offset }
+    }
+
+    /// The point of the offset: the fragment is numbered for a query that
+    /// already binds parameters, so nothing downstream has to renumber it.
+    #[test]
+    fn an_offset_moves_the_first_placeholder() {
+        let fragment = query(Some("read_count > 3"), "", Vec::new())
+            .rewrite_with(dialect::Postgres, offset(4))
+            .unwrap();
+        assert_eq!(
+            fragment.where_sql.as_deref(),
+            Some(r#""volumes"."read_count" > $4"#),
+        );
+    }
+
+    /// The offset shifts both dimensions, and the cursor still follows the
+    /// filter's literals -- so `values` is in bind order whatever the offset.
+    #[test]
+    fn an_offset_moves_the_cursor_along_with_the_filter() {
+        let fragment = query(
+            Some(r#"read_count > 3 && title != "Dune""#),
+            "title, name",
+            vec![CursorValue::String("Emma".to_owned()), CursorValue::Int(7)],
+        )
+        .rewrite_with(dialect::Postgres, offset(3))
+        .unwrap();
+        assert_eq!(
+            fragment.where_sql.as_deref(),
+            Some(concat!(
+                r#"(("volumes"."read_count" > $3 AND "volumes"."title" != $4))"#,
+                r#" AND (("volumes"."title" > $5)"#,
+                r#" OR ("volumes"."title" = $5 AND "volumes"."id" > $6))"#,
+            )),
+        );
+        assert_eq!(
+            fragment.values,
+            vec![
+                Value::Int(3),
+                Value::Text("Dune".to_owned()),
+                Value::Text("Emma".to_owned()),
+                Value::Int(7),
+            ],
+        );
+    }
+
+    /// There is no `$0`. sqlx-cel says so for the filter; the cursor is
+    /// numbered from the same offset and has to agree.
+    #[test]
+    fn a_zero_offset_starts_where_the_default_does() {
+        let zero = query(Some("read_count > 3"), "name", vec![CursorValue::Int(7)])
+            .rewrite_with(dialect::Postgres, offset(0))
+            .unwrap();
+        let default = query(Some("read_count > 3"), "name", vec![CursorValue::Int(7)])
+            .rewrite(dialect::Postgres)
+            .unwrap();
+
+        assert_eq!(zero, default);
+        assert_eq!(
+            zero.where_sql.as_deref(),
+            Some(r#"("volumes"."read_count" > $1) AND (("volumes"."id" > $2))"#),
+        );
+    }
+
+    /// A `?` carries no number, so there is nothing for the offset to move.
+    /// Bind order is unchanged, which is the part that still matters there.
+    #[test]
+    fn a_positional_dialect_ignores_the_offset() {
+        let shifted = query(Some("read_count > 3"), "name", vec![CursorValue::Int(7)])
+            .rewrite_with(dialect::Sqlite, offset(9))
+            .unwrap();
+        let default = query(Some("read_count > 3"), "name", vec![CursorValue::Int(7)])
+            .rewrite(dialect::Sqlite)
+            .unwrap();
+
+        assert_eq!(shifted, default);
     }
 
     /// The same query on a positional dialect: identical value *order*, but the

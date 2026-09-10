@@ -50,6 +50,35 @@ The three parsers come from
 which generates them onto the request type. Nothing stops a caller building
 `aip::OrderBy` and `aip::PageToken` by hand.
 
+## Splicing into a query that already binds
+
+Above, the fragment's placeholders come first and the caller's `LIMIT` follows
+them. For the other arrangement — a generated query with parameters of its own,
+and a filter spliced into the middle of it — say where the numbering starts:
+
+```rust
+// The query binds $1 and $2 already, so the fragment starts at $3.
+let fragment = query.rewrite_with(
+    dialect::Postgres,
+    Options { param_offset: 3, ..Default::default() },
+)?;
+
+// where_sql: Some(r#""volumes"."read_count" > $3"#)
+```
+
+The offset moves the filter and the key-set predicate together, and `values`
+stays in bind order, so the caller binds its own parameters first and the
+fragment's after them.
+
+The alternative is renumbering the fragment afterwards, which means scanning
+SQL for `$N` while stepping over the string literals a `LIKE` fragment carries.
+Nobody should have to write that scanner to paginate a table.
+
+Positional dialects ignore the offset, since a `?` carries no number — but bind
+order there follows the *text*, so a fragment spliced into the middle of such a
+query needs its values bound in the middle too. `Dialect::is_positional` is how
+to ask.
+
 ## Dialects
 
 `rewrite` takes the same `Dialect` sqlx-cel does — `dialect::Postgres`,
