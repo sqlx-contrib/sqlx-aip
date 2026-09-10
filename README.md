@@ -1,13 +1,13 @@
 # sqlx-aip
 
-> Rewrite a Google AIP `List` request — `filter`, `order_by` and `page_token` —
+> Render a Google AIP `List` request — `filter`, `order_by` and `page_token` —
 > into SQL fragments with bind values, behind a fail-closed column allow-list.
 
 [![CI](https://github.com/sqlx-contrib/sqlx-aip/actions/workflows/ci.yml/badge.svg)](https://github.com/sqlx-contrib/sqlx-aip/actions/workflows/ci.yml)
 [![Crate](https://img.shields.io/crates/v/sqlx-aip)](https://crates.io/crates/sqlx-aip)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Rewrites the query dimensions of a [Google AIP](https://google.aip.dev) `List`
+Renders the query dimensions of a [Google AIP](https://google.aip.dev) `List`
 request into SQL fragments, for [sqlx](https://github.com/launchbadge/sqlx).
 
 The Rust counterpart of [pgxaip](https://github.com/pgx-contrib/pgxaip), built
@@ -18,16 +18,25 @@ keep it that way.
 
 ```rust
 use sqlx::AssertSqlSafe;
-use sqlx_aip::{BindAll, Columns, Query, QueryFragment, dialect};
+use sqlx_aip::{BindAll, Columns, Query, QueryFragment, QueryRenderer, dialect};
 
+// Once per resource: the database, and which paths may reach which columns.
+const VOLUMES: QueryRenderer<'static, dialect::Postgres> =
+    QueryRenderer::new(dialect::Postgres).columns(Columns::new(&[
+        ("name",        "volumes.id"),
+        ("title",       "volumes.title"),
+        ("read_count",  "volumes.read_count"),
+        ("create_time", "volumes.created_at"),
+    ]));
+
+// Per request: exactly what `parse_query` hands back, field for field.
 let query = Query {
     filter: request.parse_filter()?,          // Option<cel::Program>
     order_by: request.parse_order_by()?,      // aip::OrderBy
     page_token: request.parse_page_token()?,  // aip::PageToken
-    columns: VOLUME_COLUMNS,
 };
 
-let QueryFragment { where_sql, order_sql, values } = query.rewrite(dialect::Postgres)?;
+let QueryFragment { where_sql, order_sql, values } = VOLUMES.render(&query)?;
 // where_sql: Some(r#"("volumes"."read_count" > $1) AND (("volumes"."id" > $2))"#)
 // order_sql: Some(r#""volumes"."title" ASC, "volumes"."id" ASC"#)
 
@@ -57,11 +66,8 @@ them. For the other arrangement — a generated query with parameters of its own
 and a filter spliced into the middle of it — say where the numbering starts:
 
 ```rust
-// The query binds $1 and $2 already, so the fragment starts at $3.
-let fragment = query.rewrite_with(
-    dialect::Postgres,
-    Options { param_offset: 3, ..Default::default() },
-)?;
+// The statement binds $1 and $2 already, so the fragment starts at $3.
+let fragment = VOLUMES.at(3).render(&query)?;
 
 // where_sql: Some(r#""volumes"."read_count" > $3"#)
 ```
@@ -81,7 +87,7 @@ to ask.
 
 ## Dialects
 
-`rewrite` takes the same `Dialect` sqlx-cel does — `dialect::Postgres`,
+`QueryRenderer::new` takes the same `Dialect` sqlx-cel does — `dialect::Postgres`,
 `dialect::Sqlite`, `dialect::MySql`, or your own — and the filter, the ordering
 and the cursor predicate all follow it.
 
@@ -92,9 +98,9 @@ the first. So the same ordering produces a different number of bind values:
 
 ```rust
 // ("title" > $1) OR ("title" = $1 AND "id" > $2)   — 2 values
-query.rewrite(dialect::Postgres)?;
+postgres.render(&query)?;
 // ("title" > ?)  OR ("title" = ?  AND "id" > ?)    — 3 values
-query.rewrite(dialect::Sqlite)?;
+sqlite.render(&query)?;
 ```
 
 `values` is always in bind order, so a caller that hands the whole list to
@@ -107,7 +113,7 @@ sqlx-cel's, forwarded.
 ## Stability is the caller's job
 
 **A key-set cursor is only stable if the ordering ends in a unique column.**
-Append the primary key to `order_by.fields` before rewriting, and make sure the
+Append the primary key to `order_by.fields` before rendering, and make sure the
 cursor carries a matching trailing value — as `name` does above.
 
 Without a unique tiebreaker, rows sharing the leading sort key have no defined
@@ -121,17 +127,25 @@ NULL and silently drops the row.
 
 ## The column map is the security boundary
 
-`Query::columns` is an AIP-path → column allow-list, and lookup is
+`QueryRenderer::columns` is an AIP-path → column allow-list, and lookup is
 **fail-closed**: a path that is absent is an error, so an empty map rejects
 every request. It governs all three dimensions.
 
+It lives on the renderer rather than on the `Query` because it describes the
+resource, not the request — and a renderer that was never given one has an
+empty map, so forgetting it fails loudly on the first call instead of exposing
+a field. That is also why the *dialect* is the one thing `new` insists on: a
+missing column map is an error, but a wrong dialect is silently valid SQL for
+the wrong database.
+
 ```rust
-const VOLUME_COLUMNS: Columns<'static> = Columns::new(&[
-    ("name",        "volumes.id"),
-    ("title",       "volumes.title"),
-    ("read_count",  "volumes.read_count"),
-    ("create_time", "volumes.created_at"),
-]);
+const VOLUMES: QueryRenderer<'static, dialect::Postgres> =
+    QueryRenderer::new(dialect::Postgres).columns(Columns::new(&[
+        ("name",        "volumes.id"),
+        ("title",       "volumes.title"),
+        ("read_count",  "volumes.read_count"),
+        ("create_time", "volumes.created_at"),
+    ]));
 ```
 
 This matters because a CEL environment generated from a proto declares *every*
@@ -152,11 +166,11 @@ the caller to use. Anything that would make this a query builder.
 ## Design notes
 
 The rationale lives with the code — `cargo doc --open`, or the doc comments on
-`Query::rewrite`, `QueryFragment`, `Error` and the `cursor` module.
+`QueryRenderer::render`, `QueryFragment`, `Error` and the `cursor` module.
 
 Two things worth knowing that the API docs do not say. This is a port of
 [pgxaip](https://github.com/pgx-contrib/pgxaip); its `query.go` is the
-reference for the rewrite, so read that first if you are changing the SQL that
+reference for the rendering, so read that first if you are changing the SQL that
 comes out. And it departs from pgxaip in one place on purpose: `where_sql` and
 `order_sql` are `Option<String>` rather than the empty string, because
 `if !sql.is_empty()` is easy to forget and renders `WHERE ` followed by

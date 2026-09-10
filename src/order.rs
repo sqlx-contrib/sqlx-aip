@@ -5,7 +5,7 @@ use sqlx_cel::dialect::Dialect;
 use crate::column;
 use crate::error::{Dimension, Error};
 
-/// Rewrites an AIP-132 ordering into a comma-separated list of
+/// Renders an AIP-132 ordering into a comma-separated list of
 /// `"col" ASC|DESC` terms, without the `ORDER BY` prefix.
 ///
 /// Returns `None` when there are no fields. That is the server's choice of
@@ -15,7 +15,7 @@ use crate::error::{Dimension, Error};
 /// default null ordering, and the key-set predicate in [`crate::cursor`]
 /// rejects a null cursor value outright, so the two agree by construction.
 /// Emitting one without the other would not.
-pub(crate) fn rewrite(
+pub(crate) fn render(
     order_by: &OrderBy,
     columns: Columns<'_>,
     dialect: &impl Dialect,
@@ -37,7 +37,7 @@ pub(crate) fn rewrite(
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite;
+    use super::render;
     use crate::error::{Dimension, Error};
     use aip::OrderBy;
     use sqlx_cel::Columns;
@@ -50,7 +50,7 @@ mod tests {
     ]);
 
     fn sql(order_by: &str) -> Option<String> {
-        rewrite(&order_by.parse::<OrderBy>().unwrap(), COLUMNS, &Postgres).unwrap()
+        render(&order_by.parse::<OrderBy>().unwrap(), COLUMNS, &Postgres).unwrap()
     }
 
     #[test]
@@ -66,7 +66,7 @@ mod tests {
     fn quoting_follows_the_dialect() {
         let order_by = "title, create_time desc".parse::<OrderBy>().unwrap();
         assert_eq!(
-            rewrite(&order_by, COLUMNS, &MySql).unwrap().as_deref(),
+            render(&order_by, COLUMNS, &MySql).unwrap().as_deref(),
             Some("`volumes`.`title` ASC, `volumes`.`created_at` DESC"),
         );
     }
@@ -90,7 +90,7 @@ mod tests {
     fn a_path_outside_the_column_map_fails() {
         let order_by = "shoe_size".parse::<OrderBy>().unwrap();
         assert_eq!(
-            rewrite(&order_by, COLUMNS, &Postgres).unwrap_err(),
+            render(&order_by, COLUMNS, &Postgres).unwrap_err(),
             Error::UnknownField {
                 dimension: Dimension::OrderBy,
                 path: "shoe_size".to_owned(),

@@ -13,13 +13,17 @@
 
 use aip::{CursorValue, OrderBy, PageToken};
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
-use sqlx_aip::{BindAll, Columns, Query, QueryFragment, dialect};
+use sqlx_aip::{BindAll, Columns, Query, QueryFragment, QueryRenderer, dialect};
 
 const COLUMNS: Columns<'static> = Columns::new(&[
     ("name", "volumes.id"),
     ("title", "volumes.title"),
     ("read_count", "volumes.read_count"),
 ]);
+
+/// The renderer under test: one dialect, one column map, stated once.
+const RENDERER: QueryRenderer<'static, dialect::Sqlite> =
+    QueryRenderer::new(dialect::Sqlite).columns(COLUMNS);
 
 /// Eight rows over three distinct titles. The duplicates are the point: an
 /// ordering of `title` alone cannot page these, and `title, name` can.
@@ -58,12 +62,12 @@ async fn seeded_pool() -> SqlitePool {
 }
 
 /// Runs one page of a `List` request and returns the ids it served.
-async fn page(pool: &SqlitePool, query: &Query<'_>, page_size: i64) -> Vec<i64> {
+async fn page(pool: &SqlitePool, query: &Query, page_size: i64) -> Vec<i64> {
     let QueryFragment {
         where_sql,
         order_sql,
         values,
-    } = query.rewrite(dialect::Sqlite).expect("must rewrite");
+    } = RENDERER.render(query).expect("must render");
 
     let where_clause = where_sql.map_or(String::new(), |sql| format!("WHERE {sql}"));
     let order_clause = order_sql.map_or(String::new(), |sql| format!("ORDER BY {sql}"));
@@ -108,7 +112,6 @@ async fn walk(pool: &SqlitePool, spec: &str, filter: Option<&str>, page_size: i6
             filter: filter.map(|source| cel::Program::compile(source).unwrap()),
             order_by: order_by.clone(),
             page_token: token.clone(),
-            columns: COLUMNS,
         };
         let ids = page(pool, &query, page_size).await;
         if ids.is_empty() {
@@ -169,7 +172,6 @@ async fn a_top_level_or_in_the_filter_stays_parenthesised() {
         page_token: PageToken::default()
             .next_cursor(vec![CursorValue::Int(5)])
             .unwrap(),
-        columns: COLUMNS,
     };
     // Matching rows are 1 ("Dune", 10), 2, 3 ("Dune") and 7 (read_count 9).
     // Only 7 is past the cursor; ids 1-3 coming back would mean the `OR` had
@@ -197,7 +199,6 @@ async fn cursor_values_encode_on_sqlite() {
                 cursor,
                 ..PageToken::default()
             },
-            columns: COLUMNS,
         };
         assert_eq!(page(&pool, &query, 10).await, expected, "for {spec}");
     }
@@ -210,10 +211,9 @@ async fn an_unmapped_column_never_reaches_the_database() {
         filter: Some(cel::Program::compile(r#"internal_notes == "secret""#).unwrap()),
         order_by: OrderBy::default(),
         page_token: PageToken::default(),
-        columns: COLUMNS,
     };
     assert!(matches!(
-        query.rewrite(dialect::Sqlite).unwrap_err(),
+        RENDERER.render(&query).unwrap_err(),
         sqlx_aip::Error::UnknownField { .. },
     ));
 }

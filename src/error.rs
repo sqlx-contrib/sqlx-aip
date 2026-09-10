@@ -32,7 +32,8 @@ impl fmt::Display for Dimension {
     }
 }
 
-/// Everything [`Query::rewrite`](crate::Query::rewrite) can fail with.
+/// Everything [`QueryRenderer::render`](crate::QueryRenderer::render) can fail
+/// with.
 ///
 /// The variants are worth distinguishing because each says something different
 /// about the caller:
